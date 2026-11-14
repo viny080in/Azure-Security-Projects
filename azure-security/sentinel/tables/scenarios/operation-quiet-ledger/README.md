@@ -1,0 +1,275 @@
+# Operation Quiet Ledger — a correlated, multi-table intrusion
+
+> A single intrusion on **2026-06-10**, captured across **two dozen of the library's tables** — from the phishing email and the alerts it tripped all the way to the incident case — so you can practise **cross-table correlation, incident triage, and analytic-rule testing** on data that actually joins up. Every query below runs against the per-table sample CSVs in [`sentinel/tables/`](../../README.md) once you've ingested them.
+
+> [!NOTE]
+> These are **hunting & teaching artifacts**, not finished detections. Thresholds are realistic starting points; the data deliberately mixes attacker activity with benign noise so an over-broad rule visibly over-fires.
+
+---
+
+## TL;DR
+
+An emailed phish lands in the inboxes of `priya.menon` and `alexw`. `alexw` is compromised and driven from a Netherlands Tor IP (`185.220.101.2`) into a **risky-but-successful Entra sign-in**, then a **remote-interactive logon to `FIN-WS-07`**. From there: tooling is dropped and run, **C2 over DNS** begins, the actor **moves laterally to `DC01`**, then **pivots into Azure** — escalating RBAC, harvesting **Key Vault** secrets, **listing storage keys**, and **exfiltrating finance blobs** from `stcontosofin` — and finally into **AKS** (`aks-prod-01`) to read secrets and patch a cluster-role binding. A **parallel Linux foothold** on `WEB-APP-01` (SSH brute force → sudo → auditd tampering) **kills the agent**, which shows up as a **Heartbeat gap** and an **ingestion drop** in `Usage`.
+
+## 🗺️ Attack flow
+
+```mermaid
+flowchart TD
+    P["📧 Phish delivered<br/>EmailEvents · 08:05<br/>T1566"] --> S["🔓 Risky sign-in success<br/>SigninLogs · 08:20<br/>T1078 · T1110"]
+    S --> L["💻 RDP to FIN-WS-07<br/>DeviceLogonEvents · 08:35<br/>T1133"]
+    L --> X["⚙️ Execute + drop tooling<br/>DeviceEvents · DeviceFileEvents · 08:40<br/>T1059 · T1105 · T1003"]
+    X --> C["🛰️ C2 beacon (DNS)<br/>DnsEvents · 09:15<br/>T1071.004 · T1568.002"]
+    X --> M["↔️ Lateral move to DC01<br/>SecurityEvent · 09:00<br/>T1110.003 · T1021.001 · T1136.001"]
+    M --> PE["⬆️ Azure RBAC escalation<br/>AzureActivity · 10:00<br/>T1098.003 · T1552"]
+    PE --> KV["🔑 Key Vault secrets<br/>AzureDiagnostics · 10:40<br/>T1555.006"]
+    PE --> EX["📤 Blob exfiltration<br/>StorageBlobLogs · 10:20<br/>T1530 · T1567"]
+    PE --> K8["☸️ AKS exec + secrets<br/>AKSAudit · AKSAuditAdmin · 11:00<br/>T1609 · T1552.007"]
+    S -.parallel.-> LIN["🐧 Linux foothold WEB-APP-01<br/>Syslog · LinuxAuditLog · 08:50<br/>T1110 · T1548.003 · T1003.008"]
+    LIN --> EVA["🕳️ Kill agent / tamper logs<br/>Heartbeat · Usage · 09:25<br/>T1685 · T1685.002"]
+
+    style P fill:#0078D4,color:#fff
+    style S fill:#1f6feb,color:#fff
+    style PE fill:#6f42c1,color:#fff
+    style EX fill:#e31a1c,color:#fff
+    style K8 fill:#a371f7,color:#fff
+    style EVA fill:#6e7681,color:#fff
+    style LIN fill:#2ea043,color:#fff
+```
+
+## 🎭 Cast & indicators of compromise
+
+| Type | Value | Role in the story |
+|---|---|---|
+| User | `alexw@contoso.com` | Compromised finance analyst — the through-line |
+| User | `priya.menon@contoso.com` | Also phished (delivery blast radius) |
+| Service account | `svc-backup@contoso.com` | Abused for Azure persistence/escalation |
+| Benign | `meganb@`, `jamest@`, `dvora@`, `itadmin@` | Noise + legitimate admin remediation |
+| Attacker IP | `185.220.101.2` (NL) | Primary — sign-in, RDP, Azure, exfil, AKS |
+| Attacker IP | `91.219.236.18` | Secondary — phish sender, Linux C2 |
+| Domain | `login-contoso-sso.com` | Credential-harvest phishing page |
+| Domain | `badupdate-cdn.com` | Payload host + C2 |
+| Host | `FIN-WS-07` | alexw's workstation (patient zero) |
+| Host | `DC01` | Domain controller (lateral target) |
+| Host | `WEB-APP-01` | Ubuntu server (parallel Linux foothold) |
+| Cluster | `aks-prod-01` | AKS production cluster |
+| Azure | `stcontosofin` · `kv-contoso-prod` · `rg-finance-prod` | Exfil target / secrets / resource group |
+
+> The IPs are illustrative. Some sit in real public ranges (`185.220.101.2` is a real Tor exit; `52.170.x` / `20.98.x` are Azure ranges), so don't block them on the strength of this scenario alone.
+
+## ⏱️ Kill chain — timeline
+
+| Time (UTC) | Tactic | Technique | Table(s) | What happened |
+|---|---|---|---|---|
+| 08:05 | Initial Access | [T1566](https://attack.mitre.org/techniques/T1566/) | `EmailEvents` | Lookalike-domain phish **Delivered** to priya.menon + alexw (ZAP missed it) |
+| 08:20 | Initial Access / Credential Access | [T1078](https://attack.mitre.org/techniques/T1078/) · [T1110](https://attack.mitre.org/techniques/T1110/) | `SigninLogs` | Failures then a **high-risk success** from `185.220.101.2` (NL) |
+| 08:35 | Initial Access | [T1133](https://attack.mitre.org/techniques/T1133/) | `DeviceLogonEvents` | **RemoteInteractive** logon onto `FIN-WS-07` from the attacker IP (internet-exposed RDP) |
+| 08:40–09:30 | Execution / Command & Control / Credential Access | [T1059.001](https://attack.mitre.org/techniques/T1059/001/) · [T1105](https://attack.mitre.org/techniques/T1105/) · [T1003](https://attack.mitre.org/techniques/T1003/) | `DeviceProcessEvents` · `DeviceEvents` · `DeviceFileEvents` | Process tree **winword → encoded PowerShell → LOLBins**; AMSI catch; payload from `badupdate-cdn.com`; cred-dumper renamed; finance docs zipped |
+| 08:50–09:25 | (parallel) Linux foothold | [T1110](https://attack.mitre.org/techniques/T1110/) · [T1548.003](https://attack.mitre.org/techniques/T1548/003/) · [T1003.008](https://attack.mitre.org/techniques/T1003/008/) | `Syslog` · `LinuxAuditLog` | SSH brute force on `WEB-APP-01` → sudo → `/etc/shadow` read → auditd tamper |
+| 09:00 | Credential Access / Lateral Movement / Persistence | [T1110.003](https://attack.mitre.org/techniques/T1110/003/) · [T1021.001](https://attack.mitre.org/techniques/T1021/001/) · [T1136.001](https://attack.mitre.org/techniques/T1136/001/) | `SecurityEvent` | Spray→logon on `DC01` (RDP from `FIN-WS-07`); 4672 special privileges; **4720 account created** |
+| 09:15 | Command & Control | [T1071.004](https://attack.mitre.org/techniques/T1071/004/) · [T1071.001](https://attack.mitre.org/techniques/T1071/001/) · [T1568.002](https://attack.mitre.org/techniques/T1568/002/) | `DnsEvents` · `DeviceNetworkEvents` | DNS beaconing + **DGA subdomains** to `badupdate-cdn.com`; `powershell.exe` connections to the C2 IP |
+| 09:25 | Defense Impairment | [T1685](https://attack.mitre.org/techniques/T1685/) · [T1685.002](https://attack.mitre.org/techniques/T1685/002/) | `Heartbeat` · `Usage` | `WEB-APP-01` agent **goes silent**; `Syslog` ingestion falls off (the hourly `Usage` meter reads **0** from the 11:00 bin) |
+| 09:30 | Persistence | [T1543.003](https://attack.mitre.org/techniques/T1543/003/) | `Event` | Malicious **7045 service install** on `DC01` |
+| 09:40 | Privilege Escalation (Entra) | [T1098.003](https://attack.mitre.org/techniques/T1098/003/) · [T1528](https://attack.mitre.org/techniques/T1528/) | `AuditLogs` | alexw self-added to a **privileged directory role**; rogue **app consent** + client secret |
+| 10:00 | Privilege Escalation / Credential Access (Azure) | [T1098.003](https://attack.mitre.org/techniques/T1098/003/) · [T1552](https://attack.mitre.org/techniques/T1552/) | `AzureActivity` | **roleAssignments/write** (Owner, by `alexw`), **listKeys** on `stcontosofin` (by `svc-backup`), NSG opened |
+| 10:20 | Exfiltration | [T1530](https://attack.mitre.org/techniques/T1530/) · [T1567](https://attack.mitre.org/techniques/T1567/) | `StorageBlobLogs` · `CommonSecurityLog` | **AccountKey + Anonymous** GetBlob burst; the firewall logs a **>1 GB egress** to the attacker IP |
+| 10:40 | Credential Access | [T1555.006](https://attack.mitre.org/techniques/T1555/006/) | `AzureDiagnostics` | **Key Vault** SecretGet/KeyGet on `kv-contoso-prod` after the role grant |
+| 10:30–11:00 | Impact / Credential Access | [T1565](https://attack.mitre.org/techniques/T1565/) · [T1557](https://attack.mitre.org/techniques/T1557/) | `DnsAuditEvents` | Rogue DNS records + malicious forwarder planted on `DC01` |
+| 11:00 | Container Exec / Cred Access | [T1609](https://attack.mitre.org/techniques/T1609/) · [T1552.007](https://attack.mitre.org/techniques/T1552/007/) · [T1098](https://attack.mitre.org/techniques/T1098/) | `AKSAudit` · `AKSAuditAdmin` | `pods/exec`, secret reads, **clusterrolebinding → cluster-admin**, logging deleted |
+| 08:20–11:00 | *(Detection & Response)* | — | `SecurityAlert` · `SecurityIncident` · `Alert` | The attack trips **12 product alerts**, grouped into **incident #4471** (New→Active→Closed *TruePositive*) |
+
+🔖 Load the full coverage map into [MITRE ATT&CK Navigator](https://mitre-attack.github.io/attack-navigator/): **[`mitre-navigator-layer.json`](mitre-navigator-layer.json)** (47 techniques). The detection layer (`SecurityAlert`/`SecurityIncident`) is the **defender's** view of the same timeline — start triage there and pivot down into the raw tables.
+
+---
+
+## 🔗 Cross-table correlation — the queries that reconstruct the intrusion
+
+These are the heart of the scenario: each joins ≥2 tables on the **shared cast/IOCs**. Run them after ingesting the sample CSVs.
+
+### 1. Phish → compromised sign-in *(EmailEvents → SigninLogs, on recipient = UPN)*
+Connect the delivered phish to the risky sign-in of a recipient — the "did the click work?" question.
+```kusto
+let phished =
+    EmailEvents
+    | where ThreatTypes has "Phish" and LatestDeliveryLocation startswith "Inbox"
+    | distinct RecipientEmailAddress;
+SigninLogs
+| where ResultType == "0" and RiskLevelDuringSignIn in ("medium", "high")
+| where UserPrincipalName in (phished)
+| project TimeGenerated, UserPrincipalName, IPAddress, Location, RiskLevelDuringSignIn, AppDisplayName
+| sort by TimeGenerated asc
+```
+
+### 2. Risky sign-in → endpoint logon *(SigninLogs → DeviceLogonEvents, on attacker IP)*
+Tie the cloud identity event to the on-host RDP from the **same source IP**, within 30 minutes.
+```kusto
+SigninLogs
+| where IPAddress == "185.220.101.2" and ResultType == "0"
+| project SigninTime = TimeGenerated, UserPrincipalName, IPAddress
+| join kind=inner (
+    DeviceLogonEvents
+    | where ActionType == "LogonSuccess" and LogonType == "RemoteInteractive"
+    | project LogonTime = TimeGenerated, DeviceName, AccountName, RemoteIP
+) on $left.IPAddress == $right.RemoteIP
+| where LogonTime between (SigninTime .. SigninTime + 30m)
+| project SigninTime, LogonTime, UserPrincipalName, DeviceName, AttackerIP = IPAddress
+```
+
+### 3. Storage exfil chained to the key theft *(AzureActivity → StorageBlobLogs, same account + IP)*
+The `listKeys` call (control plane) immediately precedes the **AccountKey** blob reads (data plane) — classic key-theft-to-exfil.
+```kusto
+let keyTheft =
+    AzureActivity
+    | where OperationNameValue has "listKeys" and ActivityStatusValue == "Succeeded"
+    | where tostring(split(CallerIpAddress, ":")[0]) == "185.220.101.2"
+    | summarize KeyListedAt = min(TimeGenerated), KeyCaller = take_any(Caller) by AccountName = Resource;
+StorageBlobLogs
+| where AuthenticationType in ("AccountKey", "Anonymous")
+| where tostring(split(CallerIpAddress, ":")[0]) == "185.220.101.2"
+| join kind=inner keyTheft on AccountName            // same storage account as the listKeys
+| where TimeGenerated > KeyListedAt                   // data-plane reads after the key was listed
+| summarize Reads = count(), MB = round(sum(ResponseBodySize) / 1048576.0, 1),
+            Ops = make_set(OperationName) by AccountName, CallerIp = CallerIpAddress, KeyListedAt, KeyCaller
+| sort by MB desc
+```
+
+### 4. Privilege grant → secret harvest *(AzureActivity → AzureDiagnostics, on caller IP + time)*
+A role is granted, then **Key Vault** access flips from Forbidden to Success from the same IP.
+```kusto
+AzureActivity
+| where OperationNameValue has "roleAssignments/write" and ActivityStatusValue == "Succeeded"
+| where tostring(split(CallerIpAddress, ":")[0]) == "185.220.101.2"
+| project RoleGrantTime = TimeGenerated, Caller, GrantIp = tostring(split(CallerIpAddress, ":")[0])
+| join kind=inner (
+    AzureDiagnostics
+    | where ResourceProvider == "MICROSOFT.KEYVAULT" and OperationName in ("SecretGet", "KeyGet")
+    | where ResultType == "Success"
+    | project KvTime = TimeGenerated, OperationName, requestUri_s, KvIp = identity_claim_ipaddr_s
+) on $left.GrantIp == $right.KvIp
+| where KvTime > RoleGrantTime
+| project RoleGrantTime, KvTime, Caller, OperationName, requestUri_s
+```
+
+### 5. Unified actor timeline *(union of 4 tables for one identity)*
+"Show me everything `alexw` touched, everywhere" — the single most useful triage query. Note each table stores the identity in a **different column** (the whole point of the schema docs).
+```kusto
+let actor = "alexw@contoso.com";
+union
+  (SigninLogs      | where UserPrincipalName == actor
+     | project TimeGenerated, Source = "SigninLogs",     Action = strcat("Sign-in ", ResultType), Where = IPAddress),
+  (OfficeActivity  | where UserId == actor
+     | project TimeGenerated, Source = "OfficeActivity", Action = Operation, Where = ClientIP),
+  (AzureActivity   | where Caller == actor
+     | project TimeGenerated, Source = "AzureActivity",  Action = OperationNameValue, Where = CallerIpAddress),
+  (StorageBlobLogs | where RequesterUpn == actor
+     | project TimeGenerated, Source = "StorageBlobLogs",Action = OperationName, Where = CallerIpAddress)
+| sort by TimeGenerated asc
+```
+
+### 6. Defense impairment triangulated *(Heartbeat gap + Usage drop)*
+A host that **stops beaconing** while its **ingestion falls to zero** is a logging-tamper tell — two independent signals agreeing.
+```kusto
+// 6a — which agents went silent?
+// Measure against the dataset's own last beacon, not now(): the sample is fixed at
+// 2026-06-10, so now() - LastSeen would flag every host. Use now() in production.
+let datasetEnd = toscalar(Heartbeat | summarize max(TimeGenerated));
+Heartbeat
+| summarize LastSeen = max(TimeGenerated) by Computer
+| extend SilentFor = datasetEnd - LastSeen
+| where SilentFor > 30m
+| project Computer, LastSeen, SilentFor
+```
+```kusto
+// 6b — which data sources flatlined? Usage is metered hourly, so the 09:25 agent kill
+// shows as falling Syslog volume after 09:00 and a 0 in the 11:00 bin
+Usage
+| where DataType == "Syslog"
+| summarize MB = sum(Quantity) by bin(TimeGenerated, 1h)
+| render timechart
+```
+
+### 7. Lateral movement on the DC *(SecurityEvent, spray → success from the attacker IP)*
+Single table, but the corroborating view of step 2 on the **domain controller**.
+```kusto
+SecurityEvent
+| where Computer == "DC01" and IpAddress == "185.220.101.2"
+| summarize Failed = countif(EventID == 4625), Success = countif(EventID == 4624),
+            FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated),
+            Targets = make_set(TargetUserName, 20) by IpAddress
+| where Failed >= 3 and Success >= 1
+```
+
+### 8. AI-agent abuse joined to the same session *(ASimAgentEventLogs → SigninLogs)*
+The modern twist: the compromised identity drives an **AI agent** to call sensitive tools from the attacker IP.
+```kusto
+ASimAgentEventLogs
+| where SrcIpAddr == "185.220.101.2" and isnotempty(ToolName)
+| project TimeGenerated, ActorUsername, SrcAgentName, ToolName, ModelName
+| join kind=leftouter (
+    SigninLogs | where IPAddress == "185.220.101.2"
+    | project ActorUsername = UserPrincipalName, SigninRisk = RiskLevelDuringSignIn
+) on ActorUsername
+| sort by TimeGenerated asc
+```
+
+### 9. Incident → alerts → entities *(SecurityIncident → SecurityAlert, the SOC's starting point)*
+The defender's view: take the current state of an incident, expand its bundled alerts, and pull the impacted entities out of the alert JSON — one query from "an incident opened" to "here's who/what is involved."
+```kusto
+SecurityIncident
+| summarize arg_max(LastModifiedTime, *) by IncidentNumber   // collapse the change-log to current state
+| where Status != "Closed" or Classification == "TruePositive"
+| mv-expand AlertId = AlertIds to typeof(string)
+| join kind=inner (
+    SecurityAlert
+    | project SystemAlertId, AlertName, AlertSeverity, CompromisedEntity, Tactics, Entities
+) on $left.AlertId == $right.SystemAlertId
+| mv-apply Entity = parse_json(Entities) on (
+    where Entity.Type in ("account", "host", "ip")
+    | extend ImpactedEntity = coalesce(tostring(Entity.Name), tostring(Entity.HostName), tostring(Entity.Address))
+)
+// severity is a string ("Medium" > "High" alphabetically), so rank it before taking the max
+| extend SevRank = case(AlertSeverity == "High", 3, AlertSeverity == "Medium", 2, AlertSeverity == "Low", 1, 0)
+| summarize Alerts = dcount(SystemAlertId),
+            MaxSevRank = max(SevRank),
+            Entities = make_set(ImpactedEntity, 50),
+            Tactics = make_set(Tactics, 20) by IncidentNumber, Title
+| extend MaxSeverity = case(MaxSevRank == 3, "High", MaxSevRank == 2, "Medium", MaxSevRank == 1, "Low", "Informational")
+| project-away MaxSevRank
+| sort by IncidentNumber asc
+```
+
+---
+
+## 🩺 Triage walkthrough — from one alert to full blast radius
+
+A realistic SOC path. Start with the alert most environments would actually fire first and pivot outward:
+
+1. **Alert fires:** the metric alert "Storage Egress spike (stcontosofin)" at 10:08. In a live workspace you'd see it in Azure Monitor alerts (or Azure Resource Graph): modern alerts aren't stored in the legacy `Alert` table, which the [`Alert` sample](../../Alert/README.md) uses only to replay them for practice. Pivot to **query 3** → confirms `AccountKey` reads from `185.220.101.2`.
+2. **Where did the key come from?** **Query 3's** `listKeys` → run **query 4** → the keys followed a **role grant**, and the same IP hit **Key Vault**. This is hands-on-keyboard, not a script.
+3. **Who is the actor?** Two identities share the IP: the `listKeys` caller is the `svc-backup` service account, but query 4's role grant came from `alexw`. Run **query 5** (unified timeline) for `alexw` → the timeline shows Office + sign-in activity too, so `alexw` is the way in and `svc-backup` was abused alongside it.
+4. **How did `alexw` get compromised?** Run **query 2** → RDP from the attacker IP → **query 1** → a **delivered phish**. Root cause found.
+5. **Blast radius:** the phish (query 1) also hit `priya.menon`; the attacker IP also appears on `DC01` (query 7) and in **AKS** (the [`AKSAudit`](../../AKSAudit/README.md) / [`AKSAuditAdmin`](../../AKSAuditAdmin/README.md) hunts), and query 8 shows it driving an AI agent too.
+6. **Are we still seeing them?** **Query 6** shows `WEB-APP-01` went dark — assume the Linux foothold is **un-logged** and isolate the host out-of-band.
+
+## 🔬 Hunting hypotheses that span the library
+
+- **Impossible chain:** any UPN with a high-risk `SigninLogs` success **and** an `AzureActivity` `roleAssignments/write` within 4h (identity → cloud priv-esc).
+- **Key-to-blob:** any `listKeys` in `AzureActivity` followed by `AccountKey` `StorageBlobLogs` reads > 100 MB from the same IP within 1h.
+- **Silent host during activity:** any `Computer` with `SecurityEvent`/`Syslog` activity that then disappears from `Heartbeat` for > 30m in the same window.
+- **Phish-to-pivot:** any `EmailEvents` `Delivered` phish recipient who then appears as a `DeviceLogonEvents` `RemoteInteractive` account within 1h.
+
+## 🧪 Using this to test analytic rules
+
+This dataset is purpose-built to **validate a detection before you ship it**:
+
+1. **Ingest** the relevant table samples (ADX free cluster or a Log Analytics `datatable()` function — see the [library README](../../README.md#-how-to-use-this-library)).
+2. **Run your rule's KQL** over the sample. A correct rule returns the malicious rows (e.g. the `185.220.101.2` cluster) and **ignores the benign noise** every file includes.
+3. **Tune on the false positives** the noise produces — `dvora`/`itadmin` legitimate admin actions, `meganb` clean sign-ins, benign `GetBlob` over OAuth — these are exactly what over-broad rules trip on.
+4. **Check entity mapping:** confirm your rule extracts the account/IP/host from the *correct* column per table (the [schema docs](../../README.md) list them) so entities populate in the incident.
+
+> Because the cast is shared, you can also test **multi-stage / fusion-style** logic: a rule that correlates `SigninLogs` + `AzureActivity` should light up on this data and stay quiet on a single-table benign workspace. Write that correlation as your own rule: Microsoft's Fusion engine is disabled once a workspace is onboarded to the Defender portal, where the Defender XDR correlation engine replaces it.
+
+## 📚 References
+- Per-table schemas & single-table hunts: [`sentinel/tables/`](../../README.md)
+- [Hunt for threats with Microsoft Sentinel](https://learn.microsoft.com/en-us/azure/sentinel/hunting) · [Advanced hunting in Defender XDR](https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-overview)
+- [MITRE ATT&CK](https://attack.mitre.org/) · [ATT&CK Navigator](https://mitre-attack.github.io/attack-navigator/)
+- Companion language course: [KQL reference course](../../../kql/README.md)
