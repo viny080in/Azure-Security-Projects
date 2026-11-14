@@ -1,0 +1,11 @@
+Webhook
+   ↓
+Security Detection Engine
+   ↓
+Generate Security Incident
+   ↓
+DEBUG - Incident Validation
+   ↓
+IF
+   ↓ TRUE
+Convert to File
